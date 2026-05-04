@@ -55,7 +55,15 @@ To aim and focus the lens, run the MJPEG streamer and open it in a browser on an
 python3 pi/focus_stream.py
 ```
 
-Then visit `http://<pi-ip>:8000/`. Defaults to 1280x720 @ ~4 Mbps. Stop with Ctrl+C, then start `pi/timelapse.py` for the actual capture (only one process can hold the camera at a time).
+Then visit `http://<pi-ip>:8000/`. Defaults to 1920x1080 @ 25 Mbps, downscaled from the full sensor for maximum sharpness.
+
+For pixel-peep focus checking, use `--zoom`:
+
+```
+python3 pi/focus_stream.py --zoom 4    # crops center 1/4 of sensor → effective 4x focus zoom
+```
+
+Stop with Ctrl+C, then start `pi/timelapse.py` for the actual capture (only one process can hold the camera at a time).
 
 ## Project layout
 

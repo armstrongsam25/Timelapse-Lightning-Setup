@@ -93,10 +93,12 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 def main() -> int:
     p = argparse.ArgumentParser(description="Sky Sentry MJPEG focus stream.")
     p.add_argument("--port", type=int, default=8000, help="HTTP port (default 8000)")
-    p.add_argument("--width", type=int, default=1280, help="stream width (default 1280)")
-    p.add_argument("--height", type=int, default=720, help="stream height (default 720)")
-    p.add_argument("--bitrate", type=int, default=4_000_000,
-                   help="MJPEG bitrate bps (default 4 Mbps)")
+    p.add_argument("--width", type=int, default=1920, help="stream width (default 1920)")
+    p.add_argument("--height", type=int, default=1080, help="stream height (default 1080)")
+    p.add_argument("--bitrate", type=int, default=25_000_000,
+                   help="MJPEG bitrate bps (default 25 Mbps — high for sharp focus check)")
+    p.add_argument("--zoom", type=float, default=1.0,
+                   help="digital zoom factor (e.g. 4 = crop center 1/4 of sensor for pixel-peep focus)")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -106,15 +108,28 @@ def main() -> int:
     )
 
     cam = Picamera2()
-    cam.configure(cam.create_video_configuration(main={"size": (args.width, args.height)}))
+    # Use the largest raw stream so the ISP downscales from full sensor — sharpest result.
+    sensor_w, sensor_h = cam.camera_properties["PixelArraySize"]
+    cam.configure(cam.create_video_configuration(
+        main={"size": (args.width, args.height)},
+        raw={"size": (sensor_w, sensor_h)},
+    ))
     output = StreamingOutput()
     cam.start_recording(MJPEGEncoder(bitrate=args.bitrate), FileOutput(output))
+
+    if args.zoom > 1.0:
+        crop_w = int(sensor_w / args.zoom)
+        crop_h = int(sensor_h / args.zoom)
+        crop_x = (sensor_w - crop_w) // 2
+        crop_y = (sensor_h - crop_h) // 2
+        cam.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
+        logging.info("zoom %.1fx: cropping %dx%d from sensor center", args.zoom, crop_w, crop_h)
 
     StreamingHandler.output = output
     try:
         addr = ("", args.port)
-        logging.info("streaming on http://<pi-ip>:%d/  (%dx%d)",
-                     args.port, args.width, args.height)
+        logging.info("streaming on http://<pi-ip>:%d/  (%dx%d, %.1f Mbps)",
+                     args.port, args.width, args.height, args.bitrate / 1_000_000)
         StreamingServer(addr, StreamingHandler).serve_forever()
     except KeyboardInterrupt:
         logging.info("stopping")
