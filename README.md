@@ -47,6 +47,16 @@ All flags:
 
 Ctrl+C exits cleanly and prints a session summary.
 
+### Focus stream
+
+To aim and focus the lens, run the MJPEG streamer and open it in a browser on any device on your LAN:
+
+```
+python3 pi/focus_stream.py
+```
+
+Then visit `http://<pi-ip>:8000/`. Defaults to 1280x720 @ ~4 Mbps. Stop with Ctrl+C, then start `pi/timelapse.py` for the actual capture (only one process can hold the camera at a time).
+
 ## Project layout
 
 - [pi/](pi/) — Raspberry Pi capture and (later) sensor-reader scripts
