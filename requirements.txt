@@ -1,0 +1,7 @@
+# picamera2 is NOT installed via pip on Raspberry Pi OS — install it via apt:
+#   sudo apt install -y python3-picamera2
+# It's listed here only for reference / IDE awareness; pip install will not work cleanly.
+picamera2
+
+# Future (sensor phase): serial reader for the Arduino event stream
+pyserial

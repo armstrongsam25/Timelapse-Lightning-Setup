@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+
+# Arduino
+build/
+*.hex
+*.elf
+*.bin
+.vscode/
+.arduino15/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+/mnt/
+*.log
