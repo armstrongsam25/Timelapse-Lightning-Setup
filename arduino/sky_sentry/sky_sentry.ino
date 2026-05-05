@@ -16,6 +16,7 @@
  *   DISTURBER                                    <- AS3935 saw a man-made signal
  *   NOISE                                        <- AS3935 reports too much RF noise
  *   FLASH baseline=<n> peak=<n> delta=<n>        <- TEMT6000 saw a sudden brightening
+ *   WARN flash_storm_reseeding                   <- too many flashes in a row, baseline re-seeded
  *   HB baseline=<n> raw=<n>                      <- heartbeat every 30s
  *
  * If the AS3935 isn't wired up (or fails to init), the sketch emits the WARN line
@@ -86,13 +87,52 @@ const int FLASH_DELTA_THRESHOLD = 80;
 // Cooldown after a flash so one bolt does not fire many FLASH messages.
 const unsigned long FLASH_COOLDOWN_MS = 500;
 
+// Number of analogReads averaged into one sample. The TEMT6000 + indoor
+// LED/fluorescent lighting produces a ~120 Hz envelope (full-wave rectified
+// 60 Hz mains; 100 Hz on 50 Hz mains). One sample over ~20 ms covers a
+// full cycle of either, so the AC ripple averages out instead of looking
+// like a flash. Each analogRead is ~0.1 ms, so 200 reads ~= 20 ms.
+const int SAMPLE_AVERAGE_COUNT = 200;
+
 // Heartbeat interval. Pi uses this to confirm the Arduino is alive and to
 // see what the current baseline reading looks like.
 const unsigned long HEARTBEAT_INTERVAL_MS = 30000;
 
+// Runaway-detector: if more than this many flashes fire inside the window,
+// the baseline has clearly gone stale (e.g. someone turned the lights on)
+// and we re-seed instead of leaking FLASH lines forever. Real lightning
+// storms don't sustain >2 Hz, so this won't trip on actual weather.
+const int FLASH_STORM_COUNT = 20;
+const unsigned long FLASH_STORM_WINDOW_MS = 5000;
+
 float baseline = 0;
 unsigned long lastFlashMs = 0;
 unsigned long lastHeartbeatMs = 0;
+
+// Ring of recent flash timestamps, for the runaway detector.
+unsigned long flashTimes[FLASH_STORM_COUNT];
+int flashTimesIdx = 0;
+
+// Read the light sensor with cycle-length averaging to kill mains ripple.
+int readLightAveraged() {
+  long sum = 0;
+  for (int i = 0; i < SAMPLE_AVERAGE_COUNT; i++) {
+    sum += analogRead(LIGHT_PIN);
+  }
+  return (int)(sum / SAMPLE_AVERAGE_COUNT);
+}
+
+// Re-seed baseline from a fresh batch of samples. Used at boot and after a
+// flash-storm-driven reset. delay()s between reads so the seed spans enough
+// real time to dodge any single mains cycle.
+void seedBaseline() {
+  long sum = 0;
+  for (int i = 0; i < 16; i++) {
+    sum += readLightAveraged();
+    delay(5);
+  }
+  baseline = sum / 16.0;
+}
 
 // =========================================================================
 // setup()
@@ -122,13 +162,8 @@ void setup() {
     as3935Available = true;
   }
 
-  // ---- Light sensor init: seed the baseline with 16 samples ----
-  long sum = 0;
-  for (int i = 0; i < 16; i++) {
-    sum += analogRead(LIGHT_PIN);
-    delay(10);
-  }
-  baseline = sum / 16.0;
+  // ---- Light sensor init: seed the baseline ----
+  seedBaseline();
 
   Serial.print(F("READY baseline="));
   Serial.println((int)baseline);
@@ -141,7 +176,7 @@ void loop() {
   unsigned long now = millis();
 
   // ---------- TEMT6000 flash detection ----------
-  int reading = analogRead(LIGHT_PIN);
+  int reading = readLightAveraged();
   float delta = reading - baseline;
 
   if (delta > FLASH_DELTA_THRESHOLD && (now - lastFlashMs) > FLASH_COOLDOWN_MS) {
@@ -152,6 +187,19 @@ void loop() {
     Serial.print(F(" delta="));
     Serial.println((int)delta);
     lastFlashMs = now;
+
+    // Record this flash and check the ring for a storm of flashes that's
+    // really just a stale baseline (e.g. lights came on, sensor moved).
+    flashTimes[flashTimesIdx] = now;
+    flashTimesIdx = (flashTimesIdx + 1) % FLASH_STORM_COUNT;
+    unsigned long oldest = flashTimes[flashTimesIdx];   // next slot = oldest after wrap
+    if (oldest != 0 && (now - oldest) < FLASH_STORM_WINDOW_MS) {
+      Serial.println(F("WARN flash_storm_reseeding"));
+      seedBaseline();
+      lastFlashMs = 0;
+      for (int i = 0; i < FLASH_STORM_COUNT; i++) flashTimes[i] = 0;
+      flashTimesIdx = 0;
+    }
   }
 
   // Only update baseline when not in flash cooldown. Otherwise the flash

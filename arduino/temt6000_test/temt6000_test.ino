@@ -32,6 +32,18 @@ const float BASELINE_ALPHA = 0.0005;
 const int   FLASH_DELTA_THRESHOLD = 80;
 const unsigned long FLASH_COOLDOWN_MS = 500;
 const unsigned long PRINT_INTERVAL_MS = 100;
+// 200 reads ~= 20 ms, one full mains cycle (60 Hz or 50 Hz). Cancels the
+// 100/120 Hz ripple from indoor LED/fluorescent lighting that otherwise
+// looks like a steady stream of flashes.
+const int   SAMPLE_AVERAGE_COUNT = 200;
+
+int readLightAveraged() {
+  long sum = 0;
+  for (int i = 0; i < SAMPLE_AVERAGE_COUNT; i++) {
+    sum += analogRead(LIGHT_PIN);
+  }
+  return (int)(sum / SAMPLE_AVERAGE_COUNT);
+}
 
 float baseline = 0;
 int   sessionMin = 1023;
@@ -43,11 +55,11 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
-  // Seed baseline with 16 quick samples (same as sky_sentry.ino).
+  // Seed baseline with 16 cycle-averaged samples (same as sky_sentry.ino).
   long sum = 0;
   for (int i = 0; i < 16; i++) {
-    sum += analogRead(LIGHT_PIN);
-    delay(10);
+    sum += readLightAveraged();
+    delay(5);
   }
   baseline = sum / 16.0;
   sessionMin = (int)baseline;
@@ -62,7 +74,7 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-  int reading = analogRead(LIGHT_PIN);
+  int reading = readLightAveraged();
   float delta = reading - baseline;
 
   if (reading < sessionMin) sessionMin = reading;
