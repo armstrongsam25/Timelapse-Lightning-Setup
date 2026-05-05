@@ -6,12 +6,15 @@ RequiresMountsFor=/mnt/ssd
 After=network-online.target
 Wants=network-online.target
 
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 # Edit these three to match your setup:
-User=pi
-Group=pi
-WorkingDirectory=/home/pi/Timelapse-Lightning-Setup
+User=sam
+Group=sam
+WorkingDirectory=/home/sam/Timelapse-Lightning-Setup
 
 # Optional: pass flags through to timelapse.py.
 # Examples:
@@ -20,7 +23,7 @@ WorkingDirectory=/home/pi/Timelapse-Lightning-Setup
 #   Environment=SKIP_FLASH=1
 Environment=TIMELAPSE_ARGS=
 
-ExecStart=/home/pi/Timelapse-Lightning-Setup/pi/sky-sentry.sh
+ExecStart=/home/sam/Timelapse-Lightning-Setup/pi/sky-sentry.sh
 
 # Graceful Ctrl+C -> finishes current frame, prints session summary.
 KillSignal=SIGINT
@@ -29,8 +32,6 @@ TimeoutStopSec=60
 # Don't loop hard if something is fundamentally wrong (camera busy, SSD missing, etc.).
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 StandardOutput=journal
 StandardError=journal
