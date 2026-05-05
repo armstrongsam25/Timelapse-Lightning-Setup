@@ -49,7 +49,10 @@
 
 // Indoor mode is less sensitive but rejects more household RF noise.
 // Outdoor mode is more sensitive but more false-positive-prone.
-// Since the rig is at a window pointed at the sky, OUTDOORS is correct.
+// Sensor sits inside the house near a window, so indoor mode is correct -
+// the chip is exposed to indoor RF noise (TVs, switching supplies, etc.) and
+// indoor mode rejects more of it. Flip to 1 if you ever move the sensor
+// physically outside.
 // Set to 1 for outdoor, 0 for indoor.
 #define AS3935_OUTDOOR_MODE  0
 

@@ -7,7 +7,7 @@ A sky-watching rig: a Raspberry Pi 5 captures a long-running timelapse, and a co
 - Raspberry Pi 5
 - Raspberry Pi HQ Camera (FB2) + Arducam wide-angle M12 lens, aimed at the sky
 - External SSD mounted at `/mnt/ssd`
-- Arduino Uno R3 + TEMT6000 phototransistor *(wired to A0)* + DFRobot SEN0290 AS3935 lightning sensor *(pending — arriving later)*
+- Arduino Uno R3 + TEMT6000 phototransistor *(wired to A0)* + DFRobot SEN0290 AS3935 lightning sensor *(wired: + → 5V, - → GND, C → A5 (SCL), D → A4 (SDA), IRQ → D2)*
 
 The Arduino sketch lives in [arduino/sky_sentry/](arduino/sky_sentry/) and uses the `DFRobot_AS3935` library. The sketch tolerates a missing AS3935 — if the sensor doesn't ACK on I2C at boot it emits a `WARN as3935_not_present` line and runs in TEMT6000-only mode, so you can fly the rig today and just plug the SEN0290 in when it arrives.
 
@@ -197,7 +197,7 @@ Gotchas:
 
 - [x] Pi timelapse capture script
 - [x] Wire up TEMT6000 to the Arduino (A0)
-- [ ] Wire up SEN0290 (waiting on hardware)
-- [ ] Pi serial reader for the Arduino event stream
-- [ ] Storm-mode capture (long exposures / burst)
-- [ ] Frame tagger to mark keepers around `LIGHTNING` / `FLASH` events
+- [x] Wire up SEN0290
+- [x] Pi serial reader for the Arduino event stream
+- [x] Storm-mode capture (long exposures / burst)
+- [x] Frame tagger to mark keepers around `LIGHTNING` / `FLASH` events
