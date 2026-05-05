@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import queue
 import shutil
 import signal
+import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -64,6 +68,98 @@ class FlashWatcher:
     def last_event_mono(self) -> float:
         with self._lock:
             return self._last_event
+
+
+class NtfyNotifier:
+    """Background pusher: PUT a JPEG to ntfy when lightning is detected.
+
+    The capture loop calls `enqueue()` once per burst (on the first tagged
+    _LIGHTNING frame). A single daemon worker drains a bounded queue and
+    sends each image as the body of a PUT request, with title/priority/tags
+    in headers. All network errors are logged and swallowed — the capture
+    loop is never blocked by a slow or downed ntfy.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, base_url: str, topic: str, enabled: bool) -> None:
+        self.url = f"{base_url.rstrip('/')}/{topic}"
+        self.enabled = enabled
+        self._q: queue.Queue = queue.Queue(maxsize=4)
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if not self.enabled:
+            log.info("ntfy disabled; lightning notifications will not be sent")
+            return
+        self._thread = threading.Thread(
+            target=self._worker, name="ntfy-sender", daemon=True
+        )
+        self._thread.start()
+        log.info("ntfy notifier started -> %s", self.url)
+
+    def enqueue(self, image_path: Path, when: datetime) -> None:
+        if not self.enabled:
+            return
+        try:
+            self._q.put_nowait((image_path, when))
+        except queue.Full:
+            log.warning("ntfy queue full, dropping notification for %s", image_path)
+
+    def stop(self) -> None:
+        if not self.enabled or self._thread is None:
+            return
+        self._stop.set()
+        # Nudge the worker out of q.get() promptly.
+        try:
+            self._q.put_nowait(self._SENTINEL)
+        except queue.Full:
+            pass
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if item is self._SENTINEL:
+                return
+            image_path, when = item
+            self._send_one(image_path, when)
+
+    def _send_one(self, image_path: Path, when: datetime) -> None:
+        try:
+            data = image_path.read_bytes()
+        except OSError as e:
+            log.warning("ntfy: could not read %s: %s", image_path, e)
+            return
+        headers = {
+            "Title": "Lightning detected",
+            "Message": f"{when:%H:%M:%S} - burst started ({image_path.name})",
+            "Priority": "urgent",
+            "Tags": "zap,camera_flash",
+            "Filename": image_path.name,
+        }
+        req = urllib.request.Request(
+            self.url, data=data, method="PUT", headers=headers
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status >= 400:
+                    log.warning("ntfy: server returned %d for %s",
+                                resp.status, image_path.name)
+                else:
+                    log.info("ntfy: pushed %s (%d bytes)",
+                             image_path.name, len(data))
+        except urllib.error.HTTPError as e:
+            log.warning("ntfy: HTTP %d sending %s: %s",
+                        e.code, image_path.name, e.reason)
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            log.warning("ntfy: send failed for %s: %s", image_path.name, e)
+        except Exception as e:  # never let the worker die on an unexpected error
+            log.warning("ntfy: unexpected error sending %s: %s",
+                        image_path.name, e)
 
 
 def arduino_reader(port: str, baud: int, watcher: FlashWatcher) -> None:
@@ -136,6 +232,12 @@ def parse_args() -> argparse.Namespace:
                    help=f"seconds between frames during burst mode (default {DEFAULT_BURST_INTERVAL}, 0 = as fast as possible)")
     p.add_argument("--burst-duration", type=float, default=DEFAULT_BURST_DURATION,
                    help=f"seconds to stay in burst mode after a flash (default {DEFAULT_BURST_DURATION})")
+    p.add_argument("--ntfy-url", default="http://localhost:8080",
+                   help="base URL of the ntfy server (default http://localhost:8080)")
+    p.add_argument("--ntfy-topic", default="timelapse",
+                   help="ntfy topic to publish lightning notifications to (default 'timelapse')")
+    p.add_argument("--no-ntfy", action="store_true",
+                   help="disable ntfy push notifications on lightning")
     return p.parse_args()
 
 
@@ -216,6 +318,9 @@ def main() -> int:
         )
         reader_thread.start()
 
+    notifier = NtfyNotifier(args.ntfy_url, args.ntfy_topic, enabled=not args.no_ntfy)
+    notifier.start()
+
     frame_count = 0
     flash_frame_count = 0
     total_bytes = 0
@@ -223,6 +328,7 @@ def main() -> int:
     next_deadline = start_mono
     end_mono = start_mono + args.duration if args.duration else None
     in_burst = False
+    burst_notified = False
 
     def is_burst_active() -> bool:
         last = watcher.last_event_mono()
@@ -242,6 +348,7 @@ def main() -> int:
             elif not burst_now and in_burst:
                 log.info("burst mode ended -> back to %.1fs interval", args.interval)
                 in_burst = False
+                burst_notified = False
                 # Reset cadence so the next normal frame fires "interval" from now,
                 # not from a stale next_deadline rooted before the burst.
                 next_deadline = time.monotonic()
@@ -266,6 +373,9 @@ def main() -> int:
                     path.rename(tagged)
                     path = tagged
                     flash_frame_count += 1
+                    if not burst_notified:
+                        notifier.enqueue(path, now)
+                        burst_notified = True
                 except OSError as e:
                     log.warning("could not rename %s -> %s: %s", path, tagged, e)
 
@@ -311,6 +421,7 @@ def main() -> int:
                     break  # new flash -> capture now, burst mode kicks in next iter
                 sleep_for = next_deadline - time.monotonic()
     finally:
+        notifier.stop()
         cam.stop()
         cam.close()
         elapsed = time.monotonic() - start_mono
