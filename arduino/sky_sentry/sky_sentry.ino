@@ -10,12 +10,17 @@
  *
  * Serial protocol (115200 baud, line-based, the Pi just needs to readline):
  *   BOOT
+ *   WARN as3935_not_present                      <- AS3935 didn't ACK on I2C; sketch runs in TEMT6000-only mode
  *   READY baseline=<n>
  *   LIGHTNING distance_km=<n> intensity=<n>     <- AS3935 detected a real strike
  *   DISTURBER                                    <- AS3935 saw a man-made signal
  *   NOISE                                        <- AS3935 reports too much RF noise
  *   FLASH baseline=<n> peak=<n> delta=<n>        <- TEMT6000 saw a sudden brightening
  *   HB baseline=<n> raw=<n>                      <- heartbeat every 30s
+ *
+ * If the AS3935 isn't wired up (or fails to init), the sketch emits the WARN line
+ * once and continues in TEMT6000-only mode. Plug the sensor in, reset the Arduino,
+ * and the lightning lines start appearing automatically - no recompile needed.
  */
 
 #include <Wire.h>
@@ -48,6 +53,10 @@
 #define AS3935_OUTDOOR_MODE  0
 
 DFRobot_AS3935_I2C lightning(IRQ_PIN, AS3935_I2C_ADDR);
+
+// True once we've successfully talked to the AS3935 over I2C. Stays false in
+// TEMT6000-only mode so loop() knows to skip the lightning register reads.
+bool as3935Available = false;
 
 // Set from the ISR, cleared by loop(). volatile because it crosses contexts.
 volatile bool lightningIsrTrig = false;
@@ -94,20 +103,24 @@ void setup() {
   Serial.println(F("BOOT"));
 
   // ---- Lightning sensor init ----
+  // A failed begin() means nothing ACKed at AS3935_I2C_ADDR. Most likely the
+  // SEN0290 isn't plugged in yet. Warn the Pi once and keep running so the
+  // TEMT6000 path still works. When the sensor gets wired up later, a reset
+  // will pick it up automatically.
   if (lightning.begin() != 0) {
-    Serial.println(F("ERROR as3935_init_failed"));
-    while (1) delay(1000);   // halt - check wiring and I2C address
-  }
-  lightning.defInit();
-  lightning.powerUp();
-  if (AS3935_OUTDOOR_MODE) {
-    lightning.setOutdoors();
+    Serial.println(F("WARN as3935_not_present"));
   } else {
-    lightning.setIndoors();
+    lightning.defInit();
+    lightning.powerUp();
+    if (AS3935_OUTDOOR_MODE) {
+      lightning.setOutdoors();
+    } else {
+      lightning.setIndoors();
+    }
+    lightning.setTuningCaps(AS3935_CAPACITANCE);
+    attachInterrupt(digitalPinToInterrupt(IRQ_PIN), lightningISR, RISING);
+    as3935Available = true;
   }
-  lightning.setTuningCaps(AS3935_CAPACITANCE);
-
-  attachInterrupt(digitalPinToInterrupt(IRQ_PIN), lightningISR, RISING);
 
   // ---- Light sensor init: seed the baseline with 16 samples ----
   long sum = 0;
@@ -148,7 +161,7 @@ void loop() {
   }
 
   // ---------- SEN0290 lightning interrupt handling ----------
-  if (lightningIsrTrig) {
+  if (as3935Available && lightningIsrTrig) {
     lightningIsrTrig = false;
     delay(5);   // give the chip a moment before reading its registers
 
