@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from libcamera import Transform
 from picamera2 import Picamera2
 
 try:
@@ -169,7 +170,10 @@ def session_dir(base: Path) -> Path:
 
 def build_camera(resolution: tuple[int, int], quality: int) -> Picamera2:
     cam = Picamera2()
-    config = cam.create_still_configuration(main={"size": resolution})
+    config = cam.create_still_configuration(
+        main={"size": resolution},
+        transform=Transform(hflip=1, vflip=1),
+    )
     cam.configure(config)
     cam.options["quality"] = quality
     cam.start()

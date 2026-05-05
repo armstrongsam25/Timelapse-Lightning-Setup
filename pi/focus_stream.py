@@ -10,6 +10,7 @@ import socketserver
 from http import server
 from threading import Condition
 
+from libcamera import Transform
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
@@ -113,6 +114,7 @@ def main() -> int:
     cam.configure(cam.create_video_configuration(
         main={"size": (args.width, args.height)},
         raw={"size": (sensor_w, sensor_h)},
+        transform=Transform(hflip=1, vflip=1),
     ))
     output = StreamingOutput()
     cam.start_recording(MJPEGEncoder(bitrate=args.bitrate), FileOutput(output))
