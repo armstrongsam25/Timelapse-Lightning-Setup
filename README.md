@@ -43,7 +43,15 @@ All flags:
 --duration SECONDS    stop after N seconds (default: run forever)
 --resolution WxH      capture size (default 4056x3040)
 --quality N           JPEG quality 1-100 (default 90)
+--arduino-port PATH   serial device for FLASH tagging (default /dev/ttyACM0)
+--no-arduino          don't read the Arduino; capture frames untagged
+--burst-interval SEC  seconds between frames during burst (default 0.0 = as fast as possible)
+--burst-duration SEC  seconds to stay in burst after a flash (default 10)
 ```
+
+**Burst mode.** When the Arduino reports a `FLASH` (TEMT6000) or `LIGHTNING` (SEN0290) event, the script drops out of normal-interval timelapse and captures as fast as the camera can for `--burst-duration` seconds. Every frame captured during a burst is renamed with `_LIGHTNING` appended (e.g. `img_213045_134221_LIGHTNING.jpg` — the extra suffix is microseconds, since burst frames can come faster than 1/sec). A new flash inside the window extends the burst. After the window ends, the script drops back to the normal `--interval` cadence. The journal logs each transition (`entering burst mode` / `burst mode ended`) so you can scan `journalctl -u sky-sentry` and see exactly when storms hit.
+
+If `pyserial` isn't installed or the serial port isn't available, a warning is logged and capture continues untagged at the normal interval.
 
 Ctrl+C exits cleanly and prints a session summary.
 
