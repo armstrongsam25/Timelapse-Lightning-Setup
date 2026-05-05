@@ -11,9 +11,46 @@ from http import server
 from threading import Condition
 
 from libcamera import Transform
-from picamera2 import Picamera2
+from picamera2 import MappedArray, Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # type: ignore[assignment]
+
+
+class FocusMeter:
+    """Laplacian-variance focus score with a slowly-decaying rolling peak."""
+
+    def __init__(self, roi_frac: float = 0.25, peak_decay: float = 0.997):
+        self.roi_frac = roi_frac
+        self.peak_decay = peak_decay
+        self.peak = 0.0
+
+    def annotate(self, frame):
+        h, w = frame.shape[:2]
+        rw, rh = int(w * self.roi_frac), int(h * self.roi_frac)
+        x0, y0 = (w - rw) // 2, (h - rh) // 2
+        roi = frame[y0:y0 + rh, x0:x0 + rw]
+        bgr = roi[..., :3] if roi.ndim == 3 and roi.shape[2] >= 3 else roi
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+        score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        self.peak = max(self.peak * self.peak_decay, score)
+        ratio = score / self.peak if self.peak > 0 else 0.0
+
+        if ratio > 0.95:
+            color, label = (0, 255, 0), "IN FOCUS"
+        elif ratio > 0.80:
+            color, label = (0, 215, 255), "CLOSE"
+        else:
+            color, label = (0, 80, 255), "ADJUST"
+
+        cv2.rectangle(frame, (x0, y0), (x0 + rw, y0 + rh), color, 2)
+        text = f"{label}  score {score:>6.0f}  peak {self.peak:>6.0f}  {ratio * 100:>3.0f}%"
+        cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
+        cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
 PAGE = """\
 <!doctype html>
@@ -100,6 +137,8 @@ def main() -> int:
                    help="MJPEG bitrate bps (default 25 Mbps — high for sharp focus check)")
     p.add_argument("--zoom", type=float, default=1.0,
                    help="digital zoom factor (e.g. 4 = crop center 1/4 of sensor for pixel-peep focus)")
+    p.add_argument("--no-focus-overlay", action="store_true",
+                   help="disable the on-frame focus-score overlay")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -116,6 +155,18 @@ def main() -> int:
         raw={"size": (sensor_w, sensor_h)},
         transform=Transform(hflip=1, vflip=1),
     ))
+    if not args.no_focus_overlay:
+        if cv2 is None:
+            logging.warning("cv2 not installed — focus overlay disabled (apt install python3-opencv)")
+        else:
+            meter = FocusMeter()
+
+            def _draw_overlay(request):
+                with MappedArray(request, "main") as m:
+                    meter.annotate(m.array)
+
+            cam.pre_callback = _draw_overlay
+
     output = StreamingOutput()
     cam.start_recording(MJPEGEncoder(bitrate=args.bitrate), FileOutput(output))
 
