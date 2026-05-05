@@ -19,7 +19,9 @@ from pathlib import Path
 DEFAULT_INPUT = Path("images")
 DEFAULT_OUTPUT = Path("videos")
 DEFAULT_FPS = 60
-DEFAULT_CRF = 18
+DEFAULT_CRF = 14
+DEFAULT_PRESET = "slow"
+DEFAULT_TUNE = "film"
 DATE_FMT = "%Y-%m-%d"
 
 log = logging.getLogger("make_timelapse")
@@ -48,6 +50,10 @@ def parse_args() -> argparse.Namespace:
                    help=f"output frame rate (default {DEFAULT_FPS})")
     p.add_argument("--crf", type=int, default=DEFAULT_CRF,
                    help=f"libx264 CRF, lower = better quality (default {DEFAULT_CRF})")
+    p.add_argument("--preset", type=str, default=DEFAULT_PRESET,
+                   help=f"libx264 preset, slower = better compression (default {DEFAULT_PRESET})")
+    p.add_argument("--tune", type=str, default=DEFAULT_TUNE,
+                   help=f"libx264 tune (default {DEFAULT_TUNE}; pass empty string to disable)")
     p.add_argument("--resolution", type=parse_resolution, default=None,
                    help="downscale to WxH (default: native capture resolution)")
     p.add_argument("--dry-run", action="store_true",
@@ -98,6 +104,8 @@ def build_ffmpeg_cmd(
     output_path: Path,
     fps: int,
     crf: int,
+    preset: str,
+    tune: str | None,
     resolution: tuple[int, int] | None,
 ) -> list[str]:
     cmd: list[str] = [
@@ -110,9 +118,15 @@ def build_ffmpeg_cmd(
         cmd += ["-vf", f"scale={resolution[0]}:{resolution[1]}"]
     cmd += [
         "-c:v", "libx264",
+        "-preset", preset,
+        *(["-tune", tune] if tune else []),
+        "-profile:v", "high",
+        "-level", "4.2",
         "-pix_fmt", "yuv420p",
         "-crf", str(crf),
-        "-preset", "medium",
+        "-g", str(fps),
+        "-keyint_min", str(fps),
+        "-bf", "2",
         "-movflags", "+faststart",
         str(output_path),
     ]
@@ -125,6 +139,8 @@ def encode_session(
     output_dir: Path,
     fps: int,
     crf: int,
+    preset: str,
+    tune: str | None,
     resolution: tuple[int, int] | None,
     dry_run: bool,
 ) -> bool:
@@ -139,7 +155,7 @@ def encode_session(
     with tempfile.TemporaryDirectory(prefix="sky-sentry-concat-") as tmp:
         list_path = Path(tmp) / "frames.txt"
         write_concat_list(frames, list_path)
-        cmd = build_ffmpeg_cmd(list_path, output_path, fps, crf, resolution)
+        cmd = build_ffmpeg_cmd(list_path, output_path, fps, crf, preset, tune, resolution)
 
         if dry_run:
             log.info("dry-run cmd: %s", " ".join(cmd))
@@ -188,15 +204,17 @@ def main() -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
 
-    log.info("encoding %d session(s) from %s -> %s (fps=%d, crf=%d%s)",
+    log.info("encoding %d session(s) from %s -> %s (fps=%d, crf=%d, preset=%s, tune=%s%s)",
              len(sessions), args.input, args.output, args.fps, args.crf,
+             args.preset, args.tune or "<none>",
              f", scale={args.resolution[0]}x{args.resolution[1]}" if args.resolution else "")
 
+    tune = args.tune or None
     failures = 0
     for session_date, session_dir in sessions:
         ok = encode_session(
             session_date, session_dir, args.output,
-            args.fps, args.crf, args.resolution, args.dry_run,
+            args.fps, args.crf, args.preset, tune, args.resolution, args.dry_run,
         )
         if not ok:
             failures += 1
