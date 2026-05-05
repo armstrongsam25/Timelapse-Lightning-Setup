@@ -26,3 +26,5 @@ Thumbs.db
 # Project
 /mnt/
 *.log
+/images/
+/videos/

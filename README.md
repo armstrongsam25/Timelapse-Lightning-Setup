@@ -73,6 +73,22 @@ python3 pi/focus_stream.py --zoom 4    # crops center 1/4 of sensor → effectiv
 
 Stop with Ctrl+C, then start `pi/timelapse.py` for the actual capture (only one process can hold the camera at a time).
 
+## Building videos
+
+Once frames have been pulled off the Pi (e.g. `rsync -av pi@<host>:/mnt/ssd/timelapse/ ./images/`), [make_timelapse.py](make_timelapse.py) assembles them into one MP4 per date folder. Output goes to `videos/<YYYY-MM-DD>.mp4`. Requires `ffmpeg` on PATH (`sudo apt install ffmpeg` on Linux, `winget install Gyan.FFmpeg` on Windows, `brew install ffmpeg` on macOS).
+
+```
+python make_timelapse.py                              # encode every date folder in images/
+python make_timelapse.py --start 2026-05-01           # only folders on or after this date
+python make_timelapse.py --end 2026-05-15             # only folders on or before this date
+python make_timelapse.py --start 2026-05-01 --end 2026-05-15
+python make_timelapse.py --resolution 1920x1080       # downscale (default: native)
+python make_timelapse.py --fps 30 --crf 20            # tweak frame rate / quality
+python make_timelapse.py --dry-run                    # show ffmpeg invocation, don't encode
+```
+
+Defaults are tuned for YouTube: 60 fps, H.264 yuv420p, CRF 18, `+faststart`. Burst frames (`*_LIGHTNING.jpg`) are included in filename order, which means flashes naturally render as a brief slow-motion section since burst frames are denser in time but each takes a single output frame.
+
 ## Arduino
 
 Two sketches live under [arduino/](arduino/):
@@ -185,6 +201,7 @@ Gotchas:
 
 ## Project layout
 
+- [make_timelapse.py](make_timelapse.py) — assembles pulled-back frames into per-day MP4s with ffmpeg
 - [pi/](pi/) — Raspberry Pi capture and (later) sensor-reader scripts
 - [pi/sky-sentry.sh](pi/sky-sentry.sh) — flash-Arduino-then-launch-timelapse one-shot launcher
 - [pi/sky-sentry.service](pi/sky-sentry.service) — systemd unit that runs the launcher at boot
