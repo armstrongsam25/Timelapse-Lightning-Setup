@@ -14,10 +14,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from libcamera import Transform
+from libcamera import Transform, controls
 from picamera2 import Picamera2
 
 try:
@@ -36,6 +37,21 @@ DISK_ABORT_BYTES = 500 * 1024**2   # 500 MB
 DEFAULT_ARDUINO_PORT = "/dev/ttyACM0"
 DEFAULT_ARDUINO_BAUD = 115200
 LIGHTNING_SUFFIX = "_LIGHTNING"
+
+# Adaptive low-light controls. picamera2's default AE caps shutter around
+# 1/15s, which goes pitch black after dark. We widen FrameDurationLimits and
+# use AeExposureMode.Long so the AE itself can pick multi-second exposures
+# at dusk. When AE rails at the ceiling for several frames in a row we
+# switch to fully manual "night mode" (max shutter, max gain). Periodically
+# we re-probe AE to detect dawn and switch back.
+DEFAULT_MAX_EXPOSURE_US = 8_000_000   # 8 s, well inside the 30 s interval
+DEFAULT_MAX_GAIN = 16.0                # IMX477 analog gain ceiling
+NIGHT_TRIGGER_FRAMES = 3               # consecutive AE-railed frames -> manual
+NIGHT_PROBE_EVERY = 10                 # frames between AE probes while in night
+EXPOSURE_RAIL_RATIO = 0.90             # treat AE as railed at >=90% of max
+GAIN_RAIL_THRESHOLD = 14.0
+DAWN_EXIT_RATIO = 0.50                 # AE probe below 50% of max -> back to auto
+MIN_FRAME_DURATION_US = 33_333         # ~30 fps lower bound
 
 # Burst mode: when a FLASH/LIGHTNING event arrives, capture as fast as the
 # camera can for BURST_DURATION seconds. Every burst frame gets _LIGHTNING.
@@ -238,6 +254,12 @@ def parse_args() -> argparse.Namespace:
                    help="ntfy topic to publish lightning notifications to (default 'timelapse')")
     p.add_argument("--no-ntfy", action="store_true",
                    help="disable ntfy push notifications on lightning")
+    p.add_argument("--max-exposure-us", type=int, default=DEFAULT_MAX_EXPOSURE_US,
+                   help=f"upper bound on shutter speed in microseconds (default {DEFAULT_MAX_EXPOSURE_US} = 8s)")
+    p.add_argument("--max-gain", type=float, default=DEFAULT_MAX_GAIN,
+                   help=f"upper bound on analog gain when in night mode (default {DEFAULT_MAX_GAIN})")
+    p.add_argument("--no-night-mode", action="store_true",
+                   help="disable manual long-exposure fallback (AE Long mode only)")
     return p.parse_args()
 
 
@@ -270,7 +292,8 @@ def session_dir(base: Path) -> Path:
     return d
 
 
-def build_camera(resolution: tuple[int, int], quality: int) -> Picamera2:
+def build_camera(resolution: tuple[int, int], quality: int,
+                 max_exposure_us: int) -> Picamera2:
     cam = Picamera2()
     config = cam.create_still_configuration(
         main={"size": resolution},
@@ -278,9 +301,69 @@ def build_camera(resolution: tuple[int, int], quality: int) -> Picamera2:
     )
     cam.configure(config)
     cam.options["quality"] = quality
+    cam.set_controls({
+        "AeEnable": True,
+        "AeExposureMode": controls.AeExposureModeEnum.Long,
+        "FrameDurationLimits": (MIN_FRAME_DURATION_US, max_exposure_us),
+    })
     cam.start()
     time.sleep(2)  # AE/AWB settle
     return cam
+
+
+def apply_exposure_mode(cam: Picamera2, mode: str,
+                        max_exposure_us: int, max_gain: float) -> None:
+    """Switch the camera between AE-driven `auto` and manual `night` mode.
+
+    `night` clamps shutter and gain to their ceilings so the sensor is
+    pulling every photon it can. `auto` returns to AE Long, which handles
+    daylight through nautical twilight on its own.
+    """
+    if mode == "night":
+        cam.set_controls({
+            "AeEnable": False,
+            "ExposureTime": max_exposure_us,
+            "AnalogueGain": max_gain,
+            "FrameDurationLimits": (MIN_FRAME_DURATION_US, max_exposure_us),
+        })
+    else:
+        cam.set_controls({
+            "AeEnable": True,
+            "AeExposureMode": controls.AeExposureModeEnum.Long,
+            "FrameDurationLimits": (MIN_FRAME_DURATION_US, max_exposure_us),
+        })
+
+
+def decide_next_mode(history: deque, current_mode: str,
+                     just_did_probe: bool,
+                     args: argparse.Namespace) -> str:
+    """Return the mode the next frame should be captured in.
+
+    auto -> night when AE has been railed at the ceiling for the last
+    NIGHT_TRIGGER_FRAMES frames. night -> auto only on a probe frame
+    (AE temporarily re-enabled by the capture loop) whose AE-chosen
+    exposure came back below DAWN_EXIT_RATIO of the ceiling.
+    """
+    if args.no_night_mode or not history:
+        return "auto"
+
+    rail_exposure = args.max_exposure_us * EXPOSURE_RAIL_RATIO
+
+    if current_mode == "auto":
+        if len(history) < NIGHT_TRIGGER_FRAMES:
+            return "auto"
+        railed = all(
+            (m.get("ExposureTime", 0) or 0) >= rail_exposure
+            and (m.get("AnalogueGain", 0.0) or 0.0) >= GAIN_RAIL_THRESHOLD
+            for m in history
+        )
+        return "night" if railed else "auto"
+
+    if just_did_probe:
+        last_exposure = history[-1].get("ExposureTime", 0) or 0
+        if last_exposure < args.max_exposure_us * DAWN_EXIT_RATIO:
+            return "auto"
+    return "night"
 
 
 def format_mb(n_bytes: int) -> str:
@@ -305,7 +388,7 @@ def main() -> int:
     if args.duration is not None:
         log.info("duration capped at %.0fs", args.duration)
 
-    cam = build_camera(args.resolution, args.quality)
+    cam = build_camera(args.resolution, args.quality, args.max_exposure_us)
 
     watcher = FlashWatcher()
     reader_thread: threading.Thread | None = None
@@ -329,6 +412,8 @@ def main() -> int:
     end_mono = start_mono + args.duration if args.duration else None
     in_burst = False
     burst_notified = False
+    exposure_history: deque = deque(maxlen=NIGHT_TRIGGER_FRAMES)
+    exposure_mode = "auto"
 
     def is_burst_active() -> bool:
         last = watcher.last_event_mono()
@@ -362,9 +447,27 @@ def main() -> int:
                 base_name += f"_{now.microsecond:06d}"
             path = out_dir / f"{base_name}.jpg"
 
+            # Probe frame: while in night mode, every NIGHT_PROBE_EVERY frames
+            # we briefly hand control back to AE so the next capture's
+            # metadata tells us whether the scene has brightened (dawn).
+            # Skipped during a lightning burst — the storm isn't dawn.
+            is_probe = (
+                not args.no_night_mode
+                and exposure_mode == "night"
+                and not in_burst
+                and frame_count > 0
+                and frame_count % NIGHT_PROBE_EVERY == 0
+            )
+            if is_probe:
+                apply_exposure_mode(cam, "auto", args.max_exposure_us, args.max_gain)
+                time.sleep(0.5)  # let AE converge before the probe capture
+
             t0 = time.monotonic()
             cam.capture_file(str(path))
             t1 = time.monotonic()
+
+            md = cam.capture_metadata()
+            exposure_history.append(md)
 
             # Tag every burst frame with _LIGHTNING.
             if in_burst:
@@ -389,6 +492,25 @@ def main() -> int:
                 elapsed = time.monotonic() - start_mono
                 log.info("heartbeat: %d frames in %.0fs, %s total",
                          frame_count, elapsed, format_mb(total_bytes))
+
+            # ---------- Adaptive exposure mode ----------
+            next_mode = decide_next_mode(exposure_history, exposure_mode,
+                                         is_probe, args)
+            if next_mode != exposure_mode:
+                log.info("exposure mode: %s -> %s (%.0f ms @ %.1fx gain, lux=%s)",
+                         exposure_mode, next_mode,
+                         (md.get("ExposureTime") or 0) / 1000,
+                         md.get("AnalogueGain") or 0.0,
+                         md.get("Lux"))
+                apply_exposure_mode(cam, next_mode,
+                                    args.max_exposure_us, args.max_gain)
+                exposure_history.clear()  # reset rail-detection window
+                exposure_mode = next_mode
+            elif is_probe:
+                # Probe didn't change the mode — restore manual night settings
+                # (they were temporarily replaced with AE for the probe).
+                apply_exposure_mode(cam, "night",
+                                    args.max_exposure_us, args.max_gain)
 
             # ---------- Inter-frame wait ----------
             if in_burst:
