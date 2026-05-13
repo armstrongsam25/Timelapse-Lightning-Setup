@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Assemble Sky Sentry capture frames into per-day timelapse videos.
+"""Assemble Sky Sentry capture frames into timelapse videos.
 
 Reads `images/<YYYY-MM-DD>/img_HHMMSS[_LIGHTNING].jpg` (the layout produced by
-pi/timelapse.py) and writes one MP4 per date folder into `videos/`.
+pi/timelapse.py) and writes one MP4 per date folder into `videos/`. Pass
+`--combined` to instead produce a single `videos/<first>_to_<last>.mp4`
+spanning all matching date folders.
 """
 
 from __future__ import annotations
@@ -56,6 +58,9 @@ def parse_args() -> argparse.Namespace:
                    help=f"libx264 tune (default {DEFAULT_TUNE}; pass empty string to disable)")
     p.add_argument("--resolution", type=parse_resolution, default=None,
                    help="downscale to WxH (default: native capture resolution)")
+    p.add_argument("--combined", action="store_true",
+                   help="produce a single MP4 spanning all matching date folders "
+                        "(named videos/<first>_to_<last>.mp4) instead of one per day")
     p.add_argument("--dry-run", action="store_true",
                    help="print the ffmpeg invocations without running them")
     return p.parse_args()
@@ -133,25 +138,17 @@ def build_ffmpeg_cmd(
     return cmd
 
 
-def encode_session(
-    session_date: date,
-    session_dir: Path,
-    output_dir: Path,
+def run_encode(
+    frames: list[Path],
+    output_path: Path,
     fps: int,
     crf: int,
     preset: str,
     tune: str | None,
     resolution: tuple[int, int] | None,
     dry_run: bool,
+    label: str,
 ) -> bool:
-    frames = collect_frames(session_dir)
-    if not frames:
-        log.warning("%s: no JPEGs found, skipping", session_dir)
-        return False
-
-    output_path = output_dir / f"{session_date.isoformat()}.mp4"
-    log.info("%s: %d frames -> %s", session_date, len(frames), output_path)
-
     with tempfile.TemporaryDirectory(prefix="sky-sentry-concat-") as tmp:
         list_path = Path(tmp) / "frames.txt"
         write_concat_list(frames, list_path)
@@ -170,9 +167,60 @@ def encode_session(
 
         result = subprocess.run(cmd)
         if result.returncode != 0:
-            log.error("%s: ffmpeg exited with code %d", session_date, result.returncode)
+            log.error("%s: ffmpeg exited with code %d", label, result.returncode)
             return False
     return True
+
+
+def encode_session(
+    session_date: date,
+    session_dir: Path,
+    output_dir: Path,
+    fps: int,
+    crf: int,
+    preset: str,
+    tune: str | None,
+    resolution: tuple[int, int] | None,
+    dry_run: bool,
+) -> bool:
+    frames = collect_frames(session_dir)
+    if not frames:
+        log.warning("%s: no JPEGs found, skipping", session_dir)
+        return False
+
+    output_path = output_dir / f"{session_date.isoformat()}.mp4"
+    log.info("%s: %d frames -> %s", session_date, len(frames), output_path)
+    return run_encode(
+        frames, output_path, fps, crf, preset, tune, resolution, dry_run,
+        label=session_date.isoformat(),
+    )
+
+
+def encode_combined(
+    sessions: list[tuple[date, Path]],
+    output_dir: Path,
+    fps: int,
+    crf: int,
+    preset: str,
+    tune: str | None,
+    resolution: tuple[int, int] | None,
+    dry_run: bool,
+) -> bool:
+    frames: list[Path] = []
+    for _, session_dir in sessions:
+        frames.extend(collect_frames(session_dir))
+    if not frames:
+        log.warning("no JPEGs found across %d session(s), nothing to encode", len(sessions))
+        return False
+
+    first, last = sessions[0][0], sessions[-1][0]
+    label = f"{first.isoformat()}_to_{last.isoformat()}"
+    output_path = output_dir / f"{label}.mp4"
+    log.info("combined: %d frames across %d day(s) -> %s",
+             len(frames), len(sessions), output_path)
+    return run_encode(
+        frames, output_path, fps, crf, preset, tune, resolution, dry_run, label=label,
+    )
 
 
 def main() -> int:
@@ -210,6 +258,17 @@ def main() -> int:
              f", scale={args.resolution[0]}x{args.resolution[1]}" if args.resolution else "")
 
     tune = args.tune or None
+
+    if args.combined:
+        ok = encode_combined(
+            sessions, args.output,
+            args.fps, args.crf, args.preset, tune, args.resolution, args.dry_run,
+        )
+        if not ok:
+            return 1
+        log.info("done")
+        return 0
+
     failures = 0
     for session_date, session_dir in sessions:
         ok = encode_session(

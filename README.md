@@ -75,13 +75,15 @@ Stop with Ctrl+C, then start `pi/timelapse.py` for the actual capture (only one 
 
 ## Building videos
 
-Once frames have been pulled off the Pi (e.g. `rsync -av pi@<host>:/mnt/ssd/timelapse/ ./images/`), [make_timelapse.py](make_timelapse.py) assembles them into one MP4 per date folder. Output goes to `videos/<YYYY-MM-DD>.mp4`. Requires `ffmpeg` on PATH (`sudo apt install ffmpeg` on Linux, `winget install Gyan.FFmpeg` on Windows, `brew install ffmpeg` on macOS).
+Once frames have been pulled off the Pi (e.g. `rsync -av pi@<host>:/mnt/ssd/timelapse/ ./images/`), [make_timelapse.py](make_timelapse.py) assembles them into video. By default it writes one MP4 per date folder to `videos/<YYYY-MM-DD>.mp4`; pass `--combined` to instead write a single `videos/<first>_to_<last>.mp4` spanning every matching date folder. Requires `ffmpeg` on PATH (`sudo apt install ffmpeg` on Linux, `winget install Gyan.FFmpeg` on Windows, `brew install ffmpeg` on macOS).
 
 ```
 python make_timelapse.py                              # encode every date folder in images/
 python make_timelapse.py --start 2026-05-01           # only folders on or after this date
 python make_timelapse.py --end 2026-05-15             # only folders on or before this date
 python make_timelapse.py --start 2026-05-01 --end 2026-05-15
+python make_timelapse.py --combined                   # one MP4 spanning every date folder
+python make_timelapse.py --combined --start 2026-05-08
 python make_timelapse.py --resolution 1920x1080       # downscale (default: native)
 python make_timelapse.py --fps 30 --crf 20            # tweak frame rate / quality
 python make_timelapse.py --dry-run                    # show ffmpeg invocation, don't encode
