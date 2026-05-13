@@ -44,13 +44,14 @@ LIGHTNING_SUFFIX = "_LIGHTNING"
 # at dusk. When AE rails at the ceiling for several frames in a row we
 # switch to fully manual "night mode" (max shutter, max gain). Periodically
 # we re-probe AE to detect dawn and switch back.
-DEFAULT_MAX_EXPOSURE_US = 8_000_000   # 8 s, well inside the 30 s interval
+DEFAULT_MAX_EXPOSURE_US = 20_000_000  # 20 s — long enough to pull stars/clouds out of light-polluted suburban skies, still inside the 30 s interval
 DEFAULT_MAX_GAIN = 16.0                # IMX477 analog gain ceiling
-NIGHT_TRIGGER_FRAMES = 3               # consecutive AE-railed frames -> manual
+NIGHT_TRIGGER_FRAMES = 2               # consecutive AE-railed frames -> manual
 NIGHT_PROBE_EVERY = 10                 # frames between AE probes while in night
 EXPOSURE_RAIL_RATIO = 0.90             # treat AE as railed at >=90% of max
-GAIN_RAIL_THRESHOLD = 14.0
 DAWN_EXIT_RATIO = 0.50                 # AE probe below 50% of max -> back to auto
+LUX_NIGHT_THRESHOLD = 2.0              # sensor-reported Lux below this -> jump to night mode immediately
+LUX_DAWN_THRESHOLD = 10.0              # sensor-reported Lux above this on a probe -> back to auto
 MIN_FRAME_DURATION_US = 33_333         # ~30 fps lower bound
 
 # Burst mode: when a FLASH/LIGHTNING event arrives, capture as fast as the
@@ -339,22 +340,25 @@ def decide_next_mode(history: deque, current_mode: str,
                      args: argparse.Namespace) -> str:
     """Return the mode the next frame should be captured in.
 
-    auto -> night when AE has been railed at the ceiling for the last
-    NIGHT_TRIGGER_FRAMES frames. night -> auto only on a probe frame
-    (AE temporarily re-enabled by the capture loop) whose AE-chosen
-    exposure came back below DAWN_EXIT_RATIO of the ceiling.
+    auto -> night when sensor-reported Lux drops below LUX_NIGHT_THRESHOLD,
+    or as a backstop when AE has been railed at the exposure ceiling for
+    NIGHT_TRIGGER_FRAMES frames in a row. night -> auto only on a probe
+    frame (AE temporarily re-enabled) whose Lux reading or AE-chosen
+    exposure shows the scene has brightened.
     """
     if args.no_night_mode or not history:
         return "auto"
 
+    last_lux = history[-1].get("Lux")
     rail_exposure = args.max_exposure_us * EXPOSURE_RAIL_RATIO
 
     if current_mode == "auto":
+        if last_lux is not None and last_lux < LUX_NIGHT_THRESHOLD:
+            return "night"
         if len(history) < NIGHT_TRIGGER_FRAMES:
             return "auto"
         railed = all(
             (m.get("ExposureTime", 0) or 0) >= rail_exposure
-            and (m.get("AnalogueGain", 0.0) or 0.0) >= GAIN_RAIL_THRESHOLD
             for m in history
         )
         return "night" if railed else "auto"
@@ -362,6 +366,8 @@ def decide_next_mode(history: deque, current_mode: str,
     if just_did_probe:
         last_exposure = history[-1].get("ExposureTime", 0) or 0
         if last_exposure < args.max_exposure_us * DAWN_EXIT_RATIO:
+            return "auto"
+        if last_lux is not None and last_lux > LUX_DAWN_THRESHOLD:
             return "auto"
     return "night"
 
