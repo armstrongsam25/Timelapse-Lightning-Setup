@@ -47,7 +47,13 @@ All flags:
 --no-arduino          don't read the Arduino; capture frames untagged
 --burst-interval SEC  seconds between frames during burst (default 0.0 = as fast as possible)
 --burst-duration SEC  seconds to stay in burst after a flash (default 10)
+--max-exposure-us N   upper bound on shutter speed in µs (default 20000000 = 20s)
+--max-gain N          upper bound on analog gain (default 16.0)
+--target-brightness N target mean pixel brightness 0-255 (default 110)
+--no-adaptive         disable adaptive exposure; fall back to camera AE only
 ```
+
+**Adaptive exposure.** The camera runs a closed-loop brightness controller that measures each captured frame's mean brightness and adjusts exposure time and analog gain to maintain a consistent target (default 110/255). This handles the full day/night cycle smoothly — as the sky darkens, exposure and gain ramp up automatically; as dawn arrives, they ramp back down before the image blows out. The controller uses multiplicative steps (proportional to error magnitude) with priority ordering: gain reduces first when too bright (faster response), exposure increases first when too dark (cleaner signal). A deadzone (±15) around the target prevents oscillation. During burst mode the controller pauses to avoid interfering with fast lightning captures.
 
 **Burst mode.** When the Arduino reports a `FLASH` (TEMT6000) or `LIGHTNING` (SEN0290) event, the script drops out of normal-interval timelapse and captures as fast as the camera can for `--burst-duration` seconds. Every frame captured during a burst is renamed with `_LIGHTNING` appended (e.g. `img_213045_134221_LIGHTNING.jpg` — the extra suffix is microseconds, since burst frames can come faster than 1/sec). A new flash inside the window extends the burst. After the window ends, the script drops back to the normal `--interval` cadence. The journal logs each transition (`entering burst mode` / `burst mode ended`) so you can scan `journalctl -u sky-sentry` and see exactly when storms hit.
 

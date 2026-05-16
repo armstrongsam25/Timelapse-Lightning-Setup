@@ -14,9 +14,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
 from datetime import datetime
 from pathlib import Path
+
+from PIL import Image
 
 from libcamera import Transform, controls
 from picamera2 import Picamera2
@@ -38,21 +39,27 @@ DEFAULT_ARDUINO_PORT = "/dev/ttyACM0"
 DEFAULT_ARDUINO_BAUD = 115200
 LIGHTNING_SUFFIX = "_LIGHTNING"
 
-# Adaptive low-light controls. picamera2's default AE caps shutter around
-# 1/15s, which goes pitch black after dark. We widen FrameDurationLimits and
-# use AeExposureMode.Long so the AE itself can pick multi-second exposures
-# at dusk. When AE rails at the ceiling for several frames in a row we
-# switch to fully manual "night mode" (max shutter, max gain). Periodically
-# we re-probe AE to detect dawn and switch back.
-DEFAULT_MAX_EXPOSURE_US = 20_000_000  # 20 s — long enough to pull stars/clouds out of light-polluted suburban skies, still inside the 30 s interval
+# Adaptive exposure controller.
+# Instead of a binary night/auto toggle, we run a continuous feedback loop:
+# measure actual image brightness after each capture, compare to a target,
+# and adjust exposure time + gain with multiplicative steps.  This gives
+# smooth transitions across the full day/night cycle — no more blown-out
+# white frames at dawn.
+DEFAULT_MAX_EXPOSURE_US = 20_000_000   # 20 s — enough for night sky detail
 DEFAULT_MAX_GAIN = 16.0                # IMX477 analog gain ceiling
-NIGHT_TRIGGER_FRAMES = 2               # consecutive AE-railed frames -> manual
-NIGHT_PROBE_EVERY = 10                 # frames between AE probes while in night
-EXPOSURE_RAIL_RATIO = 0.90             # treat AE as railed at >=90% of max
-DAWN_EXIT_RATIO = 0.50                 # AE probe below 50% of max -> back to auto
-LUX_NIGHT_THRESHOLD = 2.0              # sensor-reported Lux below this -> jump to night mode immediately
-LUX_DAWN_THRESHOLD = 10.0              # sensor-reported Lux above this on a probe -> back to auto
+DEFAULT_MIN_EXPOSURE_US = 100          # ~1/10000 s floor for bright daylight
+DEFAULT_MIN_GAIN = 1.0                 # minimum analog gain
 MIN_FRAME_DURATION_US = 33_333         # ~30 fps lower bound
+
+# Brightness feedback loop tuning
+DEFAULT_TARGET_BRIGHTNESS = 110        # target mean pixel value (0-255)
+BRIGHTNESS_DEADZONE = 15               # no adjustment within ±this of target
+STEP_NORMAL_DOWN = 0.7                 # multiply exposure/gain by this when moderately bright
+STEP_NORMAL_UP = 1.4                   # multiply when moderately dark
+STEP_AGGRESSIVE_DOWN = 0.5             # multiply when severely overexposed (error > 60)
+STEP_AGGRESSIVE_UP = 2.0               # multiply when severely underexposed
+SEVERE_ERROR_THRESHOLD = 60            # |error| above this uses aggressive steps
+BRIGHTNESS_MEASURE_SIZE = 320          # thumbnail width for fast brightness calc
 
 # Burst mode: when a FLASH/LIGHTNING event arrives, capture as fast as the
 # camera can for BURST_DURATION seconds. Every burst frame gets _LIGHTNING.
@@ -256,11 +263,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-ntfy", action="store_true",
                    help="disable ntfy push notifications on lightning")
     p.add_argument("--max-exposure-us", type=int, default=DEFAULT_MAX_EXPOSURE_US,
-                   help=f"upper bound on shutter speed in microseconds (default {DEFAULT_MAX_EXPOSURE_US} = 8s)")
+                   help=f"upper bound on shutter speed in microseconds (default {DEFAULT_MAX_EXPOSURE_US})")
     p.add_argument("--max-gain", type=float, default=DEFAULT_MAX_GAIN,
-                   help=f"upper bound on analog gain when in night mode (default {DEFAULT_MAX_GAIN})")
-    p.add_argument("--no-night-mode", action="store_true",
-                   help="disable manual long-exposure fallback (AE Long mode only)")
+                   help=f"upper bound on analog gain (default {DEFAULT_MAX_GAIN})")
+    p.add_argument("--target-brightness", type=int, default=DEFAULT_TARGET_BRIGHTNESS,
+                   help=f"target mean pixel brightness 0-255 (default {DEFAULT_TARGET_BRIGHTNESS})")
+    p.add_argument("--no-adaptive", action="store_true",
+                   help="disable adaptive exposure controller (AE-only fallback)")
     return p.parse_args()
 
 
@@ -293,6 +302,137 @@ def session_dir(base: Path) -> Path:
     return d
 
 
+class AdaptiveExposureController:
+    """Closed-loop brightness controller for the timelapse camera.
+
+    After each frame, `update()` measures the mean brightness of the captured
+    JPEG and adjusts exposure time and analog gain with multiplicative steps
+    to converge on `target_brightness`.  Priority ordering:
+
+      Ramp-down (too bright): reduce gain first, then exposure.
+      Ramp-up  (too dark):    increase exposure first, then gain.
+
+    This replaces the old binary night/auto mode system with a smooth,
+    continuous controller that handles the full day/night cycle.
+    """
+
+    def __init__(self, target_brightness: int = DEFAULT_TARGET_BRIGHTNESS,
+                 min_exposure_us: int = DEFAULT_MIN_EXPOSURE_US,
+                 max_exposure_us: int = DEFAULT_MAX_EXPOSURE_US,
+                 min_gain: float = DEFAULT_MIN_GAIN,
+                 max_gain: float = DEFAULT_MAX_GAIN) -> None:
+        self.target = target_brightness
+        self.min_exp = min_exposure_us
+        self.max_exp = max_exposure_us
+        self.min_gain = min_gain
+        self.max_gain = max_gain
+        # Current state — seeded from AE or set manually.
+        self.exposure_us: int = 10_000     # 10 ms default starting point
+        self.gain: float = 1.0
+        self.last_brightness: float = -1.0  # last measured brightness
+
+    def measure_brightness(self, image_path: Path) -> float:
+        """Return mean pixel brightness (0-255) of the captured JPEG.
+
+        Downsamples to a small thumbnail for speed (~5 ms on Pi 5).
+        """
+        try:
+            with Image.open(image_path) as img:
+                img.thumbnail((BRIGHTNESS_MEASURE_SIZE,
+                               BRIGHTNESS_MEASURE_SIZE))
+                gray = img.convert("L")
+                pixels = gray.getdata()
+                mean_val = sum(pixels) / len(pixels)
+                return mean_val
+        except Exception as e:
+            log.warning("brightness measurement failed for %s: %s",
+                        image_path, e)
+            return -1.0
+
+    def update(self, brightness: float) -> tuple[int, float]:
+        """Compute new exposure/gain based on measured brightness.
+
+        Returns (exposure_us, gain) to apply for the next frame.
+        """
+        self.last_brightness = brightness
+        if brightness < 0:
+            # Measurement failed — hold current settings.
+            return self.exposure_us, self.gain
+
+        error = brightness - self.target
+
+        if abs(error) <= BRIGHTNESS_DEADZONE:
+            # Within acceptable range — don't adjust.
+            return self.exposure_us, self.gain
+
+        # Choose step factor based on error magnitude.
+        if abs(error) > SEVERE_ERROR_THRESHOLD:
+            step_down = STEP_AGGRESSIVE_DOWN
+            step_up = STEP_AGGRESSIVE_UP
+        else:
+            step_down = STEP_NORMAL_DOWN
+            step_up = STEP_NORMAL_UP
+
+        if error > 0:
+            # Too bright — reduce.  Gain first (faster response), then exposure.
+            self._ramp_down(step_down)
+        else:
+            # Too dark — increase.  Exposure first (cleaner), then gain.
+            self._ramp_up(step_up)
+
+        return self.exposure_us, self.gain
+
+    def _ramp_down(self, factor: float) -> None:
+        """Reduce brightness: cut gain first, then exposure."""
+        if self.gain > self.min_gain:
+            self.gain = max(self.min_gain, self.gain * factor)
+        else:
+            self.exposure_us = max(self.min_exp,
+                                  int(self.exposure_us * factor))
+
+    def _ramp_up(self, factor: float) -> None:
+        """Increase brightness: raise exposure first, then gain."""
+        if self.exposure_us < self.max_exp:
+            self.exposure_us = min(self.max_exp,
+                                  int(self.exposure_us * factor))
+        else:
+            self.gain = min(self.max_gain, self.gain * factor)
+
+    def apply(self, cam: Picamera2) -> None:
+        """Push current exposure/gain to the camera as manual controls."""
+        cam.set_controls({
+            "AeEnable": False,
+            "ExposureTime": self.exposure_us,
+            "AnalogueGain": self.gain,
+            "FrameDurationLimits": (MIN_FRAME_DURATION_US, self.max_exp),
+        })
+
+    def seed_from_ae(self, cam: Picamera2) -> None:
+        """Read AE's current exposure/gain choice and use as starting point.
+
+        Call this after AE has settled (camera started, waited ~2 s) so the
+        controller inherits a reasonable initial state rather than starting
+        from arbitrary defaults.
+        """
+        md = cam.capture_metadata()
+        if md:
+            exp = md.get("ExposureTime")
+            gain = md.get("AnalogueGain")
+            if exp is not None:
+                self.exposure_us = max(self.min_exp, min(int(exp), self.max_exp))
+            if gain is not None:
+                self.gain = max(self.min_gain, min(float(gain), self.max_gain))
+        log.info("adaptive exposure seeded from AE: %d µs, %.1fx gain",
+                 self.exposure_us, self.gain)
+
+    def status_str(self) -> str:
+        """One-line summary for log heartbeats."""
+        return (f"exp={self.exposure_us / 1000:.1f}ms "
+                f"gain={self.gain:.1f}x "
+                f"brightness={self.last_brightness:.0f}/255 "
+                f"target={self.target}")
+
+
 def build_camera(resolution: tuple[int, int], quality: int,
                  max_exposure_us: int) -> Picamera2:
     cam = Picamera2()
@@ -310,66 +450,6 @@ def build_camera(resolution: tuple[int, int], quality: int,
     cam.start()
     time.sleep(2)  # AE/AWB settle
     return cam
-
-
-def apply_exposure_mode(cam: Picamera2, mode: str,
-                        max_exposure_us: int, max_gain: float) -> None:
-    """Switch the camera between AE-driven `auto` and manual `night` mode.
-
-    `night` clamps shutter and gain to their ceilings so the sensor is
-    pulling every photon it can. `auto` returns to AE Long, which handles
-    daylight through nautical twilight on its own.
-    """
-    if mode == "night":
-        cam.set_controls({
-            "AeEnable": False,
-            "ExposureTime": max_exposure_us,
-            "AnalogueGain": max_gain,
-            "FrameDurationLimits": (MIN_FRAME_DURATION_US, max_exposure_us),
-        })
-    else:
-        cam.set_controls({
-            "AeEnable": True,
-            "AeExposureMode": controls.AeExposureModeEnum.Long,
-            "FrameDurationLimits": (MIN_FRAME_DURATION_US, max_exposure_us),
-        })
-
-
-def decide_next_mode(history: deque, current_mode: str,
-                     just_did_probe: bool,
-                     args: argparse.Namespace) -> str:
-    """Return the mode the next frame should be captured in.
-
-    auto -> night when sensor-reported Lux drops below LUX_NIGHT_THRESHOLD,
-    or as a backstop when AE has been railed at the exposure ceiling for
-    NIGHT_TRIGGER_FRAMES frames in a row. night -> auto only on a probe
-    frame (AE temporarily re-enabled) whose Lux reading or AE-chosen
-    exposure shows the scene has brightened.
-    """
-    if args.no_night_mode or not history:
-        return "auto"
-
-    last_lux = history[-1].get("Lux")
-    rail_exposure = args.max_exposure_us * EXPOSURE_RAIL_RATIO
-
-    if current_mode == "auto":
-        if last_lux is not None and last_lux < LUX_NIGHT_THRESHOLD:
-            return "night"
-        if len(history) < NIGHT_TRIGGER_FRAMES:
-            return "auto"
-        railed = all(
-            (m.get("ExposureTime", 0) or 0) >= rail_exposure
-            for m in history
-        )
-        return "night" if railed else "auto"
-
-    if just_did_probe:
-        last_exposure = history[-1].get("ExposureTime", 0) or 0
-        if last_exposure < args.max_exposure_us * DAWN_EXIT_RATIO:
-            return "auto"
-        if last_lux is not None and last_lux > LUX_DAWN_THRESHOLD:
-            return "auto"
-    return "night"
 
 
 def format_mb(n_bytes: int) -> str:
@@ -410,6 +490,23 @@ def main() -> int:
     notifier = NtfyNotifier(args.ntfy_url, args.ntfy_topic, enabled=not args.no_ntfy)
     notifier.start()
 
+    # ---------- Adaptive exposure controller ----------
+    if not args.no_adaptive:
+        aec = AdaptiveExposureController(
+            target_brightness=args.target_brightness,
+            min_exposure_us=DEFAULT_MIN_EXPOSURE_US,
+            max_exposure_us=args.max_exposure_us,
+            min_gain=DEFAULT_MIN_GAIN,
+            max_gain=args.max_gain,
+        )
+        aec.seed_from_ae(cam)
+        aec.apply(cam)
+        log.info("adaptive exposure controller active (target=%d)",
+                 args.target_brightness)
+    else:
+        aec = None
+        log.info("adaptive exposure disabled — using camera AE only")
+
     frame_count = 0
     flash_frame_count = 0
     total_bytes = 0
@@ -418,8 +515,6 @@ def main() -> int:
     end_mono = start_mono + args.duration if args.duration else None
     in_burst = False
     burst_notified = False
-    exposure_history: deque = deque(maxlen=NIGHT_TRIGGER_FRAMES)
-    exposure_mode = "auto"
 
     def is_burst_active() -> bool:
         last = watcher.last_event_mono()
@@ -453,27 +548,9 @@ def main() -> int:
                 base_name += f"_{now.microsecond:06d}"
             path = out_dir / f"{base_name}.jpg"
 
-            # Probe frame: while in night mode, every NIGHT_PROBE_EVERY frames
-            # we briefly hand control back to AE so the next capture's
-            # metadata tells us whether the scene has brightened (dawn).
-            # Skipped during a lightning burst — the storm isn't dawn.
-            is_probe = (
-                not args.no_night_mode
-                and exposure_mode == "night"
-                and not in_burst
-                and frame_count > 0
-                and frame_count % NIGHT_PROBE_EVERY == 0
-            )
-            if is_probe:
-                apply_exposure_mode(cam, "auto", args.max_exposure_us, args.max_gain)
-                time.sleep(0.5)  # let AE converge before the probe capture
-
             t0 = time.monotonic()
             cam.capture_file(str(path))
             t1 = time.monotonic()
-
-            md = cam.capture_metadata()
-            exposure_history.append(md)
 
             # Tag every burst frame with _LIGHTNING.
             if in_burst:
@@ -491,32 +568,28 @@ def main() -> int:
             size = path.stat().st_size
             total_bytes += size
             frame_count += 1
-            log.info("captured %s (%.0f KB, %.2fs)%s",
-                     path, size / 1024, t1 - t0, " [burst]" if in_burst else "")
+
+            # ---------- Adaptive exposure feedback ----------
+            if aec is not None and not in_burst:
+                brightness = aec.measure_brightness(path)
+                prev_exp, prev_gain = aec.exposure_us, aec.gain
+                aec.update(brightness)
+                aec.apply(cam)
+                log.info("captured %s (%.0f KB, %.2fs) | bright=%.0f "
+                         "exp=%d→%dµs gain=%.1f→%.1fx",
+                         path, size / 1024, t1 - t0, brightness,
+                         prev_exp, aec.exposure_us, prev_gain, aec.gain)
+            else:
+                log.info("captured %s (%.0f KB, %.2fs)%s",
+                         path, size / 1024, t1 - t0,
+                         " [burst]" if in_burst else "")
 
             if frame_count % HEARTBEAT_EVERY == 0:
                 elapsed = time.monotonic() - start_mono
-                log.info("heartbeat: %d frames in %.0fs, %s total",
-                         frame_count, elapsed, format_mb(total_bytes))
-
-            # ---------- Adaptive exposure mode ----------
-            next_mode = decide_next_mode(exposure_history, exposure_mode,
-                                         is_probe, args)
-            if next_mode != exposure_mode:
-                log.info("exposure mode: %s -> %s (%.0f ms @ %.1fx gain, lux=%s)",
-                         exposure_mode, next_mode,
-                         (md.get("ExposureTime") or 0) / 1000,
-                         md.get("AnalogueGain") or 0.0,
-                         md.get("Lux"))
-                apply_exposure_mode(cam, next_mode,
-                                    args.max_exposure_us, args.max_gain)
-                exposure_history.clear()  # reset rail-detection window
-                exposure_mode = next_mode
-            elif is_probe:
-                # Probe didn't change the mode — restore manual night settings
-                # (they were temporarily replaced with AE for the probe).
-                apply_exposure_mode(cam, "night",
-                                    args.max_exposure_us, args.max_gain)
+                aec_status = f" | {aec.status_str()}" if aec else ""
+                log.info("heartbeat: %d frames in %.0fs, %s total%s",
+                         frame_count, elapsed, format_mb(total_bytes),
+                         aec_status)
 
             # ---------- Inter-frame wait ----------
             if in_burst:

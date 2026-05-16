@@ -4,3 +4,6 @@
 
 # Future (sensor phase): serial reader for the Arduino event stream
 pyserial
+
+# Adaptive exposure controller: measure frame brightness to close the feedback loop
+Pillow
